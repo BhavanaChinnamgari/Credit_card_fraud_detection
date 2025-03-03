@@ -1,0 +1,321 @@
+---
+title: "Credit Card Fraud Detection Analysis"
+output: html_document
+---
+```{r}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Install and load necessary libraries
+required_packages <- c("caret", "e1071", "randomForest", "pROC", "solitude", "ggplot2", "reshape2", "PRROC", "tidyverse")
+new_packages <- required_packages[!(required_packages %in% installed.packages()[,"Package"])]
+if(length(new_packages)) install.packages(new_packages)
+sapply(required_packages, require, character.only = TRUE)
+
+```
+
+
+
+```{r}
+library(solitude)
+library(tidyverse)
+library(caret)
+library(pROC)
+library(ggplot2)
+library(reshape2)
+library(readr)
+library(e1071)
+library(xgboost)
+library(ROCR)
+library(rpart)
+library(mlbench)
+
+# Load the dataset
+credit_data <- read.csv("C:/Users/sharu/Downloads/Creditcard.csv")
+
+# Data Pre-processing
+# Check the structure of the dataset
+str(credit_data)
+
+# Handle missing values
+credit_data <- credit_data %>% drop_na()
+
+# Ensure the 'Class' column exists and contains at least two unique values
+table(credit_data$Class)
+
+# Identifying and removing outliers using z-scores for numeric variables
+z_scores <- as.data.frame(scale(credit_data[, c("Amount", "Time")]))
+outlier_indices <- which(rowSums(abs(z_scores) > 3) > 0)
+credit_data <- credit_data[-outlier_indices, ]
+
+# Removing unnecessary columns
+credit_data <- credit_data %>%
+  dplyr::select(-V3, -V4, -V7, -V8, -V13, -V17, -V23, -V27, -V28)
+
+# Ensure consistent feature names after preprocessing
+feature_names <- colnames(credit_data)[colnames(credit_data) != "Class"]
+
+# Feature scaling
+scaler <- preProcess(credit_data[, feature_names], method = c("center", "scale"))
+credit_data_scaled <- predict(scaler, credit_data[, feature_names])
+credit_data_scaled$Class <- credit_data$Class
+
+# Train-test split
+set.seed(123)
+train_indices <- createDataPartition(credit_data$Class, p = 0.8, list = FALSE)
+train_data <- credit_data_scaled[train_indices, ]
+test_data <- credit_data_scaled[-train_indices, ]
+
+# Ensure feature names match between training and test sets
+train_features <- train_data[, feature_names]
+test_features <- test_data[, feature_names]
+
+```
+
+
+```{r}
+# Train Isolation Forest model using solitude
+isolation_forest <- solitude::isolationForest$new()
+isolation_forest$fit(train_features)
+
+# Predict anomalies
+train_anomaly_scores <- isolation_forest$predict(train_features)$anomaly_score
+test_anomaly_scores <- isolation_forest$predict(test_features)$anomaly_score
+anomaly_threshold <- quantile(train_anomaly_scores, 0.95)
+train_predictions <- ifelse(train_anomaly_scores >= anomaly_threshold, 1, 0)
+test_predictions <- ifelse(test_anomaly_scores >= anomaly_threshold, 1, 0)
+
+# Evaluate the model
+iforest_train_conf_matrix <- confusionMatrix(factor(train_predictions), factor(train_data$Class))
+iforest_test_conf_matrix <- confusionMatrix(factor(test_predictions), factor(test_data$Class))
+
+print(iforest_train_conf_matrix)
+print(iforest_test_conf_matrix)
+
+# Add predictions to the test data
+test_data$IForest_Predicted_Class <- test_predictions
+
+# Display fraudulent transactions
+fraudulent_transactions_iforest <- test_data[test_data$IForest_Predicted_Class == 1, ]
+cat("Fraudulent transactions predicted by the Isolation Forest model:\n")
+head(fraudulent_transactions_iforest)
+
+# ROC Curve for test data
+roc_iforest <- roc(test_data$Class, test_anomaly_scores)
+plot(roc_iforest, col = "blue", main = "ROC Curve for Test Data - Isolation Forest model ")
+
+# Precision-Recall Curve for test data
+precision_recall_iforest <- pr.curve(scores.class0 = test_anomaly_scores[test_data$Class == 0], 
+                                     scores.class1 = test_anomaly_scores[test_data$Class == 1], 
+                                     curve = TRUE)
+plot(precision_recall_iforest, main = "Precision-Recall Curve for Test Data - Isolation Forest model")
+
+# Confusion matrix heatmap for test data
+conf_matrix_iforest <- iforest_test_conf_matrix$table
+conf_matrix_iforest <- melt(conf_matrix_iforest)
+colnames(conf_matrix_iforest) <- c("Reference", "Prediction", "Count")
+ggplot(data = conf_matrix_iforest, aes(x = Reference, y = Prediction, fill = Count)) +
+  geom_tile() +
+  geom_text(aes(label = Count), color = "white") +
+  scale_fill_gradient(low = "blue", high = "red") +
+  labs(title = "Confusion Matrix Heatmap for Test Data - Isolation Forest model", x = "Reference", y = "Prediction")
+
+```
+
+
+```{r}
+# Train Logistic Regression model
+logit_model <- glm(Class ~ ., data = train_data, family = binomial)
+logit_pred <- predict(logit_model, test_data, type = "response")
+logit_pred_class <- ifelse(logit_pred > 0.5, 1, 0)
+
+# Evaluate the model
+logit_conf_matrix <- confusionMatrix(factor(logit_pred_class), factor(test_data$Class))
+
+print(logit_conf_matrix)
+
+# Add predictions to the test data
+test_data$Logit_Predicted_Class <- logit_pred_class
+
+# Display fraudulent transactions
+fraudulent_transactions_logit <- test_data[test_data$Logit_Predicted_Class == 1, ]
+cat("Fraudulent transactions predicted by the Logistic Regression model:\n")
+head(fraudulent_transactions_logit)
+
+# ROC Curve for test data
+roc_logit <- roc(test_data$Class, logit_pred)
+plot(roc_logit, col = "red", main = "ROC Curve for Test Data - Logistic Regression model")
+
+# Precision-Recall Curve for test data
+precision_recall_logit <- pr.curve(scores.class0 = logit_pred[test_data$Class == 0], 
+                                   scores.class1 = logit_pred[test_data$Class == 1], 
+                                   curve = TRUE)
+plot(precision_recall_logit, main = "Precision-Recall Curve for Test Data - Logistic Regression model")
+
+# Confusion matrix heatmap for test data
+conf_matrix_logit <- logit_conf_matrix$table
+conf_matrix_logit <- melt(conf_matrix_logit)
+colnames(conf_matrix_logit) <- c("Reference", "Prediction", "Count")
+ggplot(data = conf_matrix_logit, aes(x = Reference, y = Prediction, fill = Count)) +
+  geom_tile() +
+  geom_text(aes(label = Count), color = "white") +
+  scale_fill_gradient(low = "blue", high = "red") +
+  labs(title = "Confusion Matrix Heatmap for Test Data - Logistic Regression model", x = "Reference", y = "Prediction")
+
+```
+
+
+```{r}
+# Train Decision Tree model
+set.seed(123)
+dt_model <- rpart(Class ~ ., data = train_data, method = "class")
+dt_pred <- predict(dt_model, test_data, type = "class")
+
+# Evaluate the model
+dt_conf_matrix <- confusionMatrix(factor(dt_pred), factor(test_data$Class))
+
+print(dt_conf_matrix)
+
+# Add predictions to the test data
+test_data$DT_Predicted_Class <- dt_pred
+
+# Display fraudulent transactions
+fraudulent_transactions_dt <- test_data[test_data$DT_Predicted_Class == 1, ]
+cat("Fraudulent transactions predicted by the Decision Tree model:\n")
+head(fraudulent_transactions_dt)
+
+# ROC Curve for test data
+roc_dt <- roc(test_data$Class, as.numeric(dt_pred))
+plot(roc_dt, col = "green", main = "ROC Curve for Test Data - Decision Tree model")
+
+# Precision-Recall Curve for test data
+precision_recall_dt <- pr.curve(scores.class0 = as.numeric(dt_pred[test_data$Class == 0]), 
+                                scores.class1 = as.numeric(dt_pred[test_data$Class == 1]), 
+                                curve = TRUE)
+plot(precision_recall_dt, main = "Precision-Recall Curve for Test Data - Decision Tree model")
+
+# Confusion matrix heatmap for test data
+conf_matrix_dt <- dt_conf_matrix$table
+conf_matrix_dt <- melt(conf_matrix_dt)
+colnames(conf_matrix_dt) <- c("Reference", "Prediction", "Count")
+ggplot(data = conf_matrix_dt, aes(x = Reference, y = Prediction, fill = Count)) +
+  geom_tile() +
+  geom_text(aes(label = Count), color = "white") +
+  scale_fill_gradient(low = "blue", high = "red") +
+  labs(title = "Confusion Matrix Heatmap for Test Data - Decision Tree model", x = "Reference", y = "Prediction")
+
+```
+
+
+
+```{r}
+# Train Gradient Boosting model
+set.seed(123)
+xgb_model <- xgboost(data = as.matrix(train_features), label = train_data$Class, 
+                     max_depth = 6, eta = 0.1, nrounds = 100, objective = "binary:logistic")
+xgb_pred <- predict(xgb_model, as.matrix(test_features))
+xgb_pred_class <- ifelse(xgb_pred > 0.5, 1, 0)
+
+# Evaluate the model
+xgb_conf_matrix <- confusionMatrix(factor(xgb_pred_class), factor(test_data$Class))
+
+print(xgb_conf_matrix)
+
+# Add predictions to the test data
+test_data$XGB_Predicted_Class <- xgb_pred_class
+
+# Display fraudulent transactions
+fraudulent_transactions_xgb <- test_data[test_data$XGB_Predicted_Class == 1, ]
+cat("Fraudulent transactions predicted by the XGBoost model:\n")
+head(fraudulent_transactions_xgb)
+
+# ROC Curve for test data
+roc_xgb <- roc(test_data$Class, xgb_pred)
+plot(roc_xgb, col = "orange", main = "ROC Curve for Test Data - Gradient Boosting model")
+
+# Precision-Recall Curve for test data
+precision_recall_xgb <- pr.curve(scores.class0 = xgb_pred[test_data$Class == 0], 
+                                 scores.class1 = xgb_pred[test_data$Class == 1], 
+                                 curve = TRUE)
+plot(precision_recall_xgb, main = "Precision-Recall Curve for Test Data - Gradient Boosting model")
+
+# Confusion matrix heatmap for test data
+conf_matrix_xgb <- xgb_conf_matrix$table
+conf_matrix_xgb <- melt(conf_matrix_xgb)
+colnames(conf_matrix_xgb) <- c("Reference", "Prediction", "Count")
+ggplot(data = conf_matrix_xgb, aes(x = Reference, y = Prediction, fill = Count)) +
+  geom_tile() +
+  geom_text(aes(label = Count), color = "white") +
+  scale_fill_gradient(low = "blue", high = "red") +
+  labs(title = "Confusion Matrix Heatmap for Test Data - Gradient Boosting model", x = "Reference", y = "Prediction")
+
+```
+
+
+
+```{r}
+# Print the evaluation metrics for all models
+cat("Model Comparison:\n")
+cat("Isolation Forest - Accuracy:", iforest_test_conf_matrix$overall['Accuracy'], "AUC-ROC:", auc(roc_iforest), "AUC-PR:", precision_recall_iforest$auc.integral, "\n")
+cat("Logistic Regression - Accuracy:", logit_conf_matrix$overall['Accuracy'], "AUC-ROC:", auc(roc_logit), "AUC-PR:", precision_recall_logit$auc.integral, "\n")
+cat("Decision Tree - Accuracy:", dt_conf_matrix$overall['Accuracy'], "AUC-ROC:", auc(roc_dt), "AUC-PR:", precision_recall_dt$auc.integral, "\n")
+cat("XGBoost - Accuracy:", xgb_conf_matrix$overall['Accuracy'], "AUC-ROC:", auc(roc_xgb), "AUC-PR:", precision_recall_xgb$auc.integral, "\n")
+
+# Determine the best model
+models <- data.frame(
+  Model = c("Isolation Forest", "Logistic Regression", "Decision Tree", "XGBoost"),
+  Accuracy = c(iforest_test_conf_matrix$overall['Accuracy'], logit_conf_matrix$overall['Accuracy'], dt_conf_matrix$overall['Accuracy'], xgb_conf_matrix$overall['Accuracy']),
+  AUC_ROC = c(auc(roc_iforest), auc(roc_logit), auc(roc_dt), auc(roc_xgb)),
+  AUC_PR = c(precision_recall_iforest$auc.integral, precision_recall_logit$auc.integral, precision_recall_dt$auc.integral, precision_recall_xgb$auc.integral)
+)
+
+print(models)
+
+# Find the best model based on Accuracy, AUC-ROC, and AUC-PR
+best_model_accuracy <- models[which.max(models$Accuracy), ]
+cat("The best model based on Accuracy is:", best_model_accuracy$Model, "with an Accuracy of", best_model_accuracy$Accuracy, "\n")
+
+best_model_auc_roc <- models[which.max(models$AUC_ROC), ]
+cat("The best model based on AUC-ROC is:", best_model_auc_roc$Model, "with an AUC-ROC of", best_model_auc_roc$AUC_ROC, "\n")
+
+best_model_auc_pr <- models[which.max(models$AUC_PR), ]
+cat("The best model based on AUC-PR is:", best_model_auc_pr$Model, "with an AUC-PR of", best_model_auc_pr$AUC_PR, "\n")
+
+```
+
+
+
+```{r}
+# Data information
+head(credit_data)
+dataset_dimensions <- dim(credit_data)
+num_rows <- dataset_dimensions[1]
+num_cols <- dataset_dimensions[2]
+cat("Total number of rows:", num_rows, "\n")
+cat("Total number of columns:", num_cols, "\n")
+
+```
+
+```{r}
+cat("Fraudulent transactions predicted by each model:\n")
+
+# Print fraudulent transactions for Isolation Forest
+cat("\nIsolation Forest:\n")
+print(head(fraudulent_transactions_iforest))
+
+# Print fraudulent transactions for Logistic Regression
+cat("\nLogistic Regression:\n")
+print(head(fraudulent_transactions_logit))
+
+# Print fraudulent transactions for Decision Tree
+cat("\nDecision Tree:\n")
+print(head(fraudulent_transactions_dt))
+
+# Print fraudulent transactions for XGBoost
+cat("\nXGBoost:\n")
+print(head(fraudulent_transactions_xgb))
+
+```
+
+
